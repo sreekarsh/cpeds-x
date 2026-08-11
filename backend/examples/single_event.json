@@ -1,0 +1,33 @@
+{
+  "eventVersion": "1.08",
+  "eventTime": "2026-08-08T10:22:57Z",
+  "eventName": "AttachUserPolicy",
+  "eventSource": "iam.amazonaws.com",
+  "userIdentity": {
+    "type": "IAMUser",
+    "principalId": "AIDAI9XQ2KKP01",
+    "arn": "arn:aws:iam::123456789012:user/carol",
+    "accountId": "123456789012",
+    "userName": "carol",
+    "mfaAuthenticated": "false"
+  },
+  "sourceIPAddress": "198.51.100.77",
+  "userAgent": "Boto3/1.34.0 Python/3.11",
+  "accountId": "123456789012",
+  "recipientAccountId": "123456789012",
+  "login_freq_1h": 9,
+  "login_freq_24h": 31,
+  "failed_auth_rate": 0.12,
+  "accessed_resources": ["arn:aws:iam::aws:policy/AdministratorAccess"],
+  "geo_anomaly_score": 2.5,
+  "api_burst_rate": 25.0,
+  "data_exfil_volume_mb": 0.0,
+  "unusual_ip_count": 2,
+  "privilege_escalation_chain": 1,
+  "priv_api_call_freq": 5,
+  "admin_policy_attach": 1,
+  "iam_change_freq": 3,
+  "lateral_movement_score": 0.3,
+  "user_account_age_days": 63,
+  "role_session_duration_min": 90
+}

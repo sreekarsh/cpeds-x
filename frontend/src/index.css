@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  background: #0a0e1a;
+  color: #e5e7eb;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #121826; }
+::-webkit-scrollbar-thumb { background: #1f2937; border-radius: 4px; }
+
+/* ============================================================
+   Auth screen (secure-access terminal)
+   ============================================================ */
+
+/* Monospace stack for the SOC / telemetry voice — no webfont needed. */
+.font-mono-soc {
+  font-family: ui-monospace, 'SFMono-Regular', 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+/* Keep dark inputs dark when the browser autofills them. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #e5e7eb;
+  -webkit-box-shadow: 0 0 0px 1000px #0d1220 inset;
+  caret-color: #e5e7eb;
+  transition: background-color 5000s ease-in-out 0s;
+}
+
+/* Signature motif: a pulse travelling down the privilege-escalation chain. */
+@keyframes killchain-pulse {
+  0%, 100% { opacity: 0.25; }
+  50%      { opacity: 1; }
+}
+@keyframes killchain-dash {
+  to { stroke-dashoffset: -24; }
+}
+@keyframes grid-drift {
+  from { background-position: 0 0; }
+  to   { background-position: 0 40px; }
+}
+@keyframes fade-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-rise { animation: fade-rise 0.5s ease-out both; }
+
+.kc-node { animation: killchain-pulse 3.2s ease-in-out infinite; }
+.kc-link { stroke-dasharray: 4 8; animation: killchain-dash 1.4s linear infinite; }
+.kc-grid { animation: grid-drift 6s linear infinite; }
+
+/* Respect users who prefer less motion. */
+@media (prefers-reduced-motion: reduce) {
+  .kc-node, .kc-link, .kc-grid, .animate-fade-rise {
+    animation: none !important;
+  }
+}
+

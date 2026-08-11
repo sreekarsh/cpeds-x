@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------
+#  CPEDS-X launcher (macOS / Linux)  ->  `./cpeds <command>`
+#
+#  Runs the in-process CLI with the project venv if present, else the
+#  system python3. cli.py is passed by absolute path but the working
+#  directory is left untouched, so relative log paths resolve against
+#  wherever you invoke it (e.g. `cpeds analyze trail.json`).
+# ---------------------------------------------------------------------
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$HERE/.venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+exec "$PY" "$HERE/cli.py" "$@"

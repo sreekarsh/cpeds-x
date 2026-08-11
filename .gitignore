@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pkl
+models/
+.venv/
+venv/
+env/
+.env
+
+# Auth / local user database
+*.db
+cpeds_users.db
+
+# Node
+node_modules/
+dist/
+.vite/
+*.local
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Personal scratch notes / local cheat-sheets (may contain pasted live secrets)
+docs/sree.txt
+scratch/
+*.scratch
+
+# Belt-and-suspenders: never commit real env files or the local auth DB
+backend/.env
+
+# Large third-party research datasets (public flaws.cloud/Stratus CloudTrail).
+# Kept locally; not committed. They contain thousands of AWS key IDs from
+# foreign/defunct accounts that trip GitHub secret-scanning. Document source in README.
+aws_dataset-main/
+backend/sample_data/stratus_real_labeled.json

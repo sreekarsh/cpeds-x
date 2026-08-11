@@ -1,0 +1,28 @@
+# Render Blueprint - one-click deploy for the CPEDS-X backend
+services:
+  - type: web
+    name: cpeds-x-backend
+    env: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    envVars:
+      - key: PORT
+        value: 8000
+      # Session signing key — Render generates a strong random value on deploy.
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      # Hosted storage (Supabase). Set these in the Render dashboard so user
+      # accounts persist across cold starts / redeploys. Leave unset to fall
+      # back to ephemeral local SQLite (fine for a quick demo, but accounts are
+      # lost when the free instance sleeps). SUPABASE_KEY must be the secret
+      # service_role key — never the public anon key.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      # Optional GenAI providers (leave unset to use template fallback):
+      # - key: OPENAI_API_KEY
+      #   sync: false
+      # - key: OLLAMA_URL
+      #   sync: false
