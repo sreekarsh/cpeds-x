@@ -45,6 +45,24 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
     return out
 
 
+def stamp_identity(event: Dict, principal: str, source_ip: str) -> Dict:
+    """Stamp the campaign's attacker principal + origin IP onto an event.
+
+    Shared by the synthetic template path (build_step_event) and the real-event
+    path (main.py's Real mode), so a sampled real CloudTrail record is attributed
+    to the same attacker identity and containment targets the right principal.
+    Mutates and returns `event`.
+    """
+    ui = dict(event.get("userIdentity", {}))
+    ui["arn"] = principal
+    ui.setdefault("type", "IAMUser")
+    ui["userName"] = principal.split("/")[-1]
+    event["userIdentity"] = ui
+    if source_ip:
+        event["sourceIPAddress"] = source_ip
+    return event
+
+
 def build_step_event(step: Dict, principal: str, source_ip: str) -> Dict:
     """
     Construct the CloudTrail event for one scenario step.
@@ -56,16 +74,7 @@ def build_step_event(step: Dict, principal: str, source_ip: str) -> Dict:
     """
     base = generate_synthetic_audit_log(step.get("threat_class", 0), randomize=False)
     event = _deep_merge(base, step.get("event", {}))
-
-    # Stamp the attacker identity + origin consistently across the campaign.
-    ui = dict(event.get("userIdentity", {}))
-    ui["arn"] = principal
-    ui.setdefault("type", "IAMUser")
-    ui["userName"] = principal.split("/")[-1]
-    event["userIdentity"] = ui
-    if source_ip:
-        event["sourceIPAddress"] = source_ip
-    return event
+    return stamp_identity(event, principal, source_ip)
 
 
 # ======================================================================

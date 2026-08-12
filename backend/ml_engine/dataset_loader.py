@@ -14,8 +14,8 @@ Two accepted dataset shapes (auto-detected per row):
      FeaturePreprocessor.extract_features_from_log() used everywhere else, so
      real training data is featurized identically to live inference.
 
-  2. Pre-computed 28-feature rows + a label field
-     Each record already carries all 28 canonical feature columns (see
+  2. Pre-computed feature rows + a label field
+     Each record already carries all canonical feature columns (see
      FeaturePreprocessor.feature_names) plus a label. Used directly, no
      re-featurization.
 
@@ -28,7 +28,10 @@ not fatal — but if the surviving, validated data is too small or single-class,
 load_labeled_dataset raises DatasetError so the caller can fall back to
 synthetic training cleanly.
 """
+import os
+import random as _random
 import re
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -79,12 +82,12 @@ def _find_label(event: Dict, label_keys) -> Tuple[Optional[int], Optional[str]]:
 
 
 def _has_precomputed_features(event: Dict, feature_names) -> bool:
-    """True if the row already carries all 28 canonical feature columns."""
+    """True if the row already carries all canonical feature columns."""
     return all(name in event for name in feature_names)
 
 
 def _vector_from_precomputed(event: Dict, feature_names) -> np.ndarray:
-    """Build a 28-vector from a row that already has the feature columns."""
+    """Build a feature vector from a row that already has the feature columns."""
     vec = np.empty(len(feature_names), dtype=float)
     for i, name in enumerate(feature_names):
         try:
@@ -119,7 +122,7 @@ def load_labeled_dataset(
 
     Returns:
         dict with:
-          X (np.ndarray Nx28), y (np.ndarray N),
+          X (np.ndarray Nx n_features), y (np.ndarray N),
           rows_total, rows_used, rows_skipped,
           per_class_counts {0..4: n},
           label_key (the column actually used),
@@ -231,3 +234,134 @@ def load_labeled_dataset(
         "label_key": label_key_used,
         "mode": mode,
     }
+
+
+# ======================================================================
+# Real-event SAMPLING for the simulator (distinct from training above).
+#
+# The Attack Simulator / Scenario Runner normally FABRICATE a CloudTrail event
+# from a synthetic template. These helpers instead pull a REAL event of a chosen
+# class straight out of a labeled dataset, so "Simulate Vertical (C2)" can replay
+# an actual C2 event and let the real-trained model judge it (honest, apples to
+# apples). The label column is stripped from the returned event so the model
+# can't peek. Parsing is cached by (path, mtime) — a click shouldn't re-read MBs.
+# ======================================================================
+
+_REAL_CACHE: Dict = {}
+_REAL_CACHE_LOCK = threading.Lock()
+
+
+def default_real_dataset_path() -> Optional[str]:
+    """Resolve the dataset the simulator's Real mode should sample from.
+
+    Precedence: $CPEDS_TRAIN_DATASET (the same var real-mode training reads),
+    then the bundled Stratus sample beside this package. Returns None if nothing
+    is present, so callers can disable Real mode cleanly.
+    """
+    env = os.getenv("CPEDS_TRAIN_DATASET", "").strip()
+    if env and os.path.isfile(env):
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))          # backend/ml_engine
+    backend_dir = os.path.dirname(here)                        # backend/
+    candidate = os.path.join(backend_dir, "sample_data",
+                             "stratus_real_labeled.json")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _events_by_class(path: str, label_keys: Tuple[str, ...]) -> Dict[int, List[Dict]]:
+    """Parse a labeled dataset into {class: [event, ...]}, cached by (path, mtime).
+
+    Each event is stored with its label column(s) removed, so what we hand to
+    the model is a clean CloudTrail record. Rows without a usable 0-4 label are
+    skipped (not fatal).
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError as e:
+        raise DatasetError(f"Could not read dataset file '{path}': {e}")
+
+    cache_key = (os.path.abspath(path), label_keys)
+    with _REAL_CACHE_LOCK:
+        hit = _REAL_CACHE.get(cache_key)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        raise DatasetError(f"Could not read dataset file '{path}': {e}")
+    try:
+        events = parse_logs(content, "auto", os.path.basename(path))
+    except LogParseError as e:
+        raise DatasetError(f"Could not parse the dataset file: {e}")
+
+    by_class: Dict[int, List[Dict]] = {c: [] for c in _VALID_LABELS}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        label, _ = _find_label(event, label_keys)
+        if label is None:
+            continue
+        clean = {k: v for k, v in event.items() if k not in label_keys}
+        by_class[label].append(clean)
+
+    with _REAL_CACHE_LOCK:
+        _REAL_CACHE[cache_key] = (mtime, by_class)
+    return by_class
+
+
+def real_event_availability(dataset_path: Optional[str] = None,
+                            label_keys: Optional[List[str]] = None
+                            ) -> Optional[Dict]:
+    """Per-class count of real events available for sampling.
+
+    Returns {"dataset": name, "per_class": {0..4: n}, "total": n} or None when no
+    dataset is present (so the UI can disable the Real toggle with a clear note).
+    """
+    keys = tuple(label_keys) if label_keys else DEFAULT_LABEL_KEYS
+    path = dataset_path or default_real_dataset_path()
+    if not path:
+        return None
+    try:
+        by_class = _events_by_class(path, keys)
+    except DatasetError:
+        return None
+    per_class = {c: len(by_class[c]) for c in _VALID_LABELS}
+    return {
+        "dataset": os.path.basename(path),
+        "per_class": per_class,
+        "total": sum(per_class.values()),
+    }
+
+
+def sample_real_event(threat_class: int,
+                      dataset_path: Optional[str] = None,
+                      label_keys: Optional[List[str]] = None,
+                      rng=None) -> Tuple[Dict, int]:
+    """Return (event, ground_truth_label): a random REAL event of `threat_class`.
+
+    The event is a real CloudTrail record (label stripped) that the caller feeds
+    straight into the model. Raises DatasetError if no dataset is available or the
+    requested class has no real examples — callers surface that as a clean 422.
+    """
+    if threat_class not in _VALID_LABELS:
+        raise DatasetError(f"threat_class must be 0-4, got {threat_class!r}.")
+    keys = tuple(label_keys) if label_keys else DEFAULT_LABEL_KEYS
+    path = dataset_path or default_real_dataset_path()
+    if not path:
+        raise DatasetError(
+            "No real dataset available for sampling. Set CPEDS_TRAIN_DATASET to "
+            "a labeled CloudTrail file, or add sample_data/stratus_real_labeled.json.")
+
+    by_class = _events_by_class(path, keys)
+    pool = by_class.get(threat_class, [])
+    if not pool:
+        counts = {c: len(by_class[c]) for c in _VALID_LABELS}
+        raise DatasetError(
+            f"The real dataset has no class-{threat_class} events to sample "
+            f"(available per class: {counts}).")
+
+    idx = int(rng.integers(len(pool))) if rng is not None else _random.randrange(len(pool))
+    # Copy so callers can stamp fields without mutating the cached pool.
+    return dict(pool[idx]), threat_class

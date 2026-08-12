@@ -1,7 +1,7 @@
 """
 CPEDS-X: Cloud Privilege Escalation Detection System
 ML Engine - Feature Preprocessor
-Handles 28-feature extraction, scaling, and SMOTE rebalancing
+Handles 32-feature extraction, scaling, and SMOTE rebalancing
 """
 import numpy as np
 import pandas as pd
@@ -12,8 +12,88 @@ from typing import Dict, List, Tuple
 import json
 
 
+# ---------------------------------------------------------------------------
+# Real-signal action sets for the errorCode / sensitive-action features.
+#
+# These three features target the classes the model most confuses on BARE
+# CloudTrail, where the magnitude features (geo_anomaly_score, api_burst_rate,
+# data_exfil_volume_mb, privilege_escalation_chain) are absent/defaulted and
+# therefore carry no signal. They are derived only from fields real CloudTrail
+# actually contains (errorCode, eventName), so they come alive on live/real
+# logs. Grounded in the labeled Stratus dataset (per-class hit-rate):
+#   access_denied_flag         -> C1 26.5%  vs 0.7% benign  (38x lift), C3 7.4%
+#   sensitive_privilege_action -> C2 62.5%  vs 0.0% benign  (zero false-positives)
+#   credential_access_action   -> C3 67.9%  vs 0.8% benign
+#
+# SYNTHETIC-INERT BY CONSTRUCTION (protects the working demo, byte-for-byte):
+# The synthetic generator only ever emits these eventNames — DescribeInstances,
+# GetObject, AssumeRole, AttachUserPolicy, CreateAccessKey, ConsoleLogin — and
+# never an errorCode. The action sets below DELIBERATELY EXCLUDE every one of
+# those six names, so on synthetic data all three new columns are constant-0.
+# A zero-variance column is never chosen for a tree split, so the synthetic
+# model + its dashboard metrics are unchanged. AttachUserPolicy/CreateAccessKey
+# are still detected on live logs by the existing admin_policy_attach /
+# priv_api_call_freq features, so nothing is lost — these features only ADD the
+# escalation/credential actions the original 28 were blind to.
+# ---------------------------------------------------------------------------
+
+# errorCode substrings that mark an authorization failure (permission probing).
+# Matches AccessDenied / AccessDeniedException, (Client.)UnauthorizedOperation,
+# and *Forbidden — the same family used to measure the C1/C3 lift above.
+DENIED_ERROR_MARKERS = ("AccessDenied", "Unauthorized", "Forbidden")
+
+# eventNames that grant/alter privileges — the vertical-escalation fingerprint.
+# Sharper than admin_policy_attach (literal 'AttachUserPolicy' only). Note:
+# AttachUserPolicy/CreateAccessKey are intentionally OMITTED (synthetic emits
+# them, and they're already covered by admin_policy_attach/priv_api_call_freq).
+SENSITIVE_PRIVILEGE_ACTIONS = frozenset({
+    'PutUserPolicy', 'PutRolePolicy', 'PutGroupPolicy',
+    'AttachRolePolicy', 'AttachGroupPolicy',
+    'CreatePolicyVersion', 'SetDefaultPolicyVersion',
+    'UpdateAccessKey', 'UpdateAssumeRolePolicy', 'AddUserToGroup',
+    'CreateLoginProfile', 'UpdateLoginProfile',
+})
+
+# eventNames that read/mint credentials or secrets — the exfil/cred-theft
+# fingerprint. CreateAccessKey is OMITTED (synthetic emits it; and it matches
+# zero exfil rows in the real data, so excluding it costs no signal).
+CREDENTIAL_ACCESS_ACTIONS = frozenset({
+    'GetSecretValue', 'BatchGetSecretValue',
+    'Decrypt', 'GenerateDataKey',
+    'GetSessionToken', 'GetFederationToken',
+    'GetPasswordData',
+})
+
+# eventNames that provision/command/enumerate compute across a fleet — the
+# lateral-movement fingerprint (C4). Before this feature, C4 had NO dedicated
+# signal: its real events are EC2/SSM instance actions that only partially trip
+# iam_change (Update*/Put*), so C4 collided with C2's iam_change and was
+# effectively invisible. Grounded in the labeled Stratus data: these 14 names
+# cover ALL 31 real C4 rows and hit ZERO of the 2403 benign rows (a clean,
+# false-positive-free discriminator that also separates C4 from C2).
+#
+# SYNTHETIC-INERT BY CONSTRUCTION: the synthetic generator only ever emits
+# DescribeInstances / GetObject / AssumeRole / AttachUserPolicy /
+# CreateAccessKey / ConsoleLogin — none of which appear below (DescribeInstances
+# and DescribeInstanceInformation are DELIBERATELY EXCLUDED: the former is
+# synthetic + benign-heavy, the latter appears 27x in benign). So on synthetic
+# data this column is constant-0, never chosen for a tree split, and the
+# synthetic model + its dashboard metrics stay byte-for-byte unchanged.
+LATERAL_MOVEMENT_ACTIONS = frozenset({
+    # EC2 instance provisioning
+    'RunInstances',
+    # SSM Run Command / Session Manager — remote code execution across hosts
+    'SendCommand', 'StartSession', 'TerminateSession', 'ResumeSession',
+    'GetConnectionStatus', 'StartAutomationExecution',
+    # SSM inventory / association recon & persistence
+    'UpdateInstanceInformation', 'UpdateInstanceAssociationStatus',
+    'ListInstanceAssociations', 'CreateAssociation',
+    'PutComplianceItems', 'PutInventory', 'GetDocument',
+})
+
+
 class FeaturePreprocessor:
-    """Extracts and normalizes 28 security features from CloudTrail audit logs"""
+    """Extracts and normalizes 32 security features from CloudTrail audit logs"""
 
     def __init__(self):
         self.scaler = StandardScaler()
@@ -22,7 +102,7 @@ class FeaturePreprocessor:
         self.feature_names = self._get_feature_names()
 
     def _get_feature_names(self) -> List[str]:
-        """Returns the 28 canonical feature names"""
+        """Returns the 32 canonical feature names"""
         return [
             'login_freq_1h', 'login_freq_24h', 'failed_auth_rate',
             'resource_entropy', 'priv_api_call_freq', 'admin_policy_attach',
@@ -33,18 +113,31 @@ class FeaturePreprocessor:
             'kms_decrypt_freq', 'secret_access_freq', 'privilege_escalation_chain',
             'lateral_movement_score', 'user_account_age_days', 'role_session_duration_min',
             'console_login_anomaly', 'cli_tool_usage', 'suspicious_user_agent',
-            'anomaly_aggregate_score'
+            'anomaly_aggregate_score',
+            # --- Real-signal features (indices 28-30). Derived only from fields
+            # bare CloudTrail actually carries (errorCode, eventName), so they
+            # add signal on real/live logs where the magnitude features are dead.
+            # Appended AFTER the original 28 so existing feature indices are
+            # unchanged (protects the synthetic model & any cached vectors).
+            'access_denied_flag', 'sensitive_privilege_action',
+            'credential_access_action',
+            # --- C4 lateral-movement feature (index 31). Keyed on the EC2/SSM
+            # instance-action vocabulary that defines real C4 but was captured by
+            # no prior feature (so C4 was invisible / confused with C2). Appended
+            # last so indices 0-30 are unchanged; synthetic-inert (see
+            # LATERAL_MOVEMENT_ACTIONS) so the synthetic model is untouched.
+            'lateral_movement_action',
         ]
 
     def extract_features_from_log(self, audit_log: Dict) -> np.ndarray:
         """
-        Extracts 28 features from a single CloudTrail audit log entry
+        Extracts 32 features from a single CloudTrail audit log entry
 
         Args:
             audit_log: Raw JSON CloudTrail event
 
         Returns:
-            28-dimensional feature vector
+            32-dimensional feature vector
         """
         features = {}
 
@@ -58,6 +151,9 @@ class FeaturePreprocessor:
         user_identity = audit_log.get('userIdentity', {})
         source_ip = audit_log.get('sourceIPAddress', '')
         user_agent = audit_log.get('userAgent', '')
+        # errorCode is the authorization-outcome field. It is often absent
+        # (success) or None; coerce to a string so substring checks are safe.
+        error_code = str(audit_log.get('errorCode') or '')
 
         # Feature 1-3: Login and auth patterns
         features['login_freq_1h'] = audit_log.get('login_freq_1h', 0)
@@ -127,6 +223,35 @@ class FeaturePreprocessor:
             features['api_burst_rate'] * 0.25 +
             features['lateral_movement_score'] * 0.25
         )
+
+        # ------------------------------------------------------------------
+        # Features 29-31: real-signal features from errorCode + eventName.
+        # These read fields bare CloudTrail actually carries, so they add
+        # discrimination on real/live logs (where the magnitude features are
+        # dead). On synthetic logs errorCode is absent and these actions are
+        # rare, so all three are ~constant-0 and inert in the tree model.
+        # ------------------------------------------------------------------
+        # Feature 29: authorization-failure flag (permission probing).
+        #   C1 26.5% vs 0.7% benign in the labeled Stratus data.
+        features['access_denied_flag'] = 1 if any(
+            m in error_code for m in DENIED_ERROR_MARKERS) else 0
+
+        # Feature 30: sensitive privilege-granting action (vertical-escalation).
+        #   C2 62.5% vs 0.0% benign (a clean, zero-false-positive C2 signal).
+        features['sensitive_privilege_action'] = (
+            1 if event_name in SENSITIVE_PRIVILEGE_ACTIONS else 0)
+
+        # Feature 31: credential/secret access action (exfil / cred-theft).
+        #   C3 67.9% vs 0.8% benign.
+        features['credential_access_action'] = (
+            1 if event_name in CREDENTIAL_ACCESS_ACTIONS else 0)
+
+        # Feature 32: lateral-movement action (EC2/SSM fleet ops) — the C4
+        #   fingerprint. Covers 100% of real C4 and 0% of benign; gives C4 its
+        #   own axis so it no longer hides behind C2's iam_change. Constant-0 on
+        #   synthetic data (none of these names are generated), so inert there.
+        features['lateral_movement_action'] = (
+            1 if event_name in LATERAL_MOVEMENT_ACTIONS else 0)
 
         # Convert to ordered array matching feature_names
         return np.array([features[name] for name in self.feature_names])
@@ -365,3 +490,125 @@ def generate_synthetic_audit_log(threat_class: int = 0, randomize: bool = False,
             base_log['recipientAccountId'] = base_log.get('accountId', '123456789012')
 
     return base_log
+
+
+# ---------------------------------------------------------------------------
+# Real-faithful minority-class specs, measured from the labeled Stratus data
+# (eventName -> weight, source; errorCode rate; userIdentity.type mix). Used
+# ONLY by generate_real_faithful_event() for TRAIN-FOLD augmentation of the
+# thin classes — never by /simulate or the demo.
+# ---------------------------------------------------------------------------
+_REAL_FAITHFUL_SPEC = {
+    1: {  # C1 Horizontal — always AssumeRole via STS; ~27% AccessDenied.
+        'events': [('AssumeRole', 'sts.amazonaws.com', 1.0)],
+        'denied_rate': 0.27, 'denied_codes': ['AccessDenied'],
+        'ui_types': [('IAMUser', 0.47), ('AWSService', 0.53)],
+    },
+    2: {  # C2 Vertical — IAM privilege-granting actions; no errorCode.
+        'events': [
+            ('AttachRolePolicy', 'iam.amazonaws.com', 6),
+            ('PutRolePolicy', 'iam.amazonaws.com', 5),
+            ('CreateUser', 'iam.amazonaws.com', 4),
+            ('CreatePolicy', 'iam.amazonaws.com', 2),
+            ('CreateLoginProfile', 'iam.amazonaws.com', 2),
+            ('UpdateAssumeRolePolicy', 'iam.amazonaws.com', 2),
+            ('CreateAccessKey', 'iam.amazonaws.com', 2),
+            ('AttachUserPolicy', 'iam.amazonaws.com', 1),
+        ],
+        'denied_rate': 0.0, 'denied_codes': [],
+        'ui_types': [('IAMUser', 1.0)],
+    },
+    4: {  # C4 Lateral — EC2/SSM fleet ops; ~23% (non-authz) errorCode.
+        'events': [
+            ('RunInstances', 'ec2.amazonaws.com', 8),
+            ('UpdateInstanceInformation', 'ssm.amazonaws.com', 7),
+            ('UpdateInstanceAssociationStatus', 'ssm.amazonaws.com', 7),
+            ('SendCommand', 'ssm.amazonaws.com', 2),
+            ('ListInstanceAssociations', 'ssm.amazonaws.com', 2),
+            ('PutComplianceItems', 'ssm.amazonaws.com', 2),
+            ('PutInventory', 'ssm.amazonaws.com', 2),
+            ('GetDocument', 'ssm.amazonaws.com', 1),
+        ],
+        'denied_rate': 0.23,
+        'denied_codes': ['Client.InvalidParameterValue', 'InvalidInstanceId',
+                         'Client.VcpuLimitExceeded'],
+        'ui_types': [('AssumedRole', 0.74), ('IAMUser', 0.26)],
+    },
+}
+
+
+def generate_real_faithful_event(threat_class: int, rng=None) -> Dict:
+    """
+    Mint a REAL-FAITHFUL synthetic CloudTrail event for a minority class
+    (C1/C2/C4), for TRAIN-FOLD augmentation only.
+
+    Unlike generate_synthetic_audit_log — which injects large magnitude fields
+    (api_burst_rate / data_exfil_volume_mb / geo_anomaly_score) that bare
+    CloudTrail NEVER carries — this emits only fields real events actually have,
+    so the featurized vector lands in the SAME region of feature space that real
+    events occupy. That is the whole point: augmenting with out-of-distribution
+    synthetic rows would teach a rule that never fires on real data and inflate
+    nothing. The signal reproduced here is exactly the real one: the eventName
+    vocabulary (which drives assume_role_freq / sensitive_privilege_action /
+    lateral_movement_action / iam_change_freq) plus realistic errorCode rates.
+    All magnitude fields are left ABSENT so they default to 0, matching real.
+
+    NOT used by /simulate or the demo (those use the canonical templates).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    spec = _REAL_FAITHFUL_SPEC.get(threat_class)
+    if spec is None:
+        # No real-faithful spec for this class -> fall back to the standard
+        # randomized generator (only C1/C2/C4 are specialised for augmentation).
+        return generate_synthetic_audit_log(threat_class, randomize=True, rng=rng)
+
+    # Weighted eventName / source choice from the real vocabulary.
+    names = [e[0] for e in spec['events']]
+    srcs = [e[1] for e in spec['events']]
+    w = np.array([e[2] for e in spec['events']], dtype=float)
+    w /= w.sum()
+    i = int(rng.choice(len(names), p=w))
+    event_name, event_source = names[i], srcs[i]
+
+    # userIdentity.type (weighted); MFA off for these real attack rows.
+    ut = spec['ui_types']
+    tw = np.array([t[1] for t in ut], dtype=float)
+    tw /= tw.sum()
+    ui_type = ut[int(rng.choice(len(ut), p=tw))][0]
+
+    # Class-INDEPENDENT timestamp within business hours on a weekday, matching
+    # the real data (every real Stratus event is a weekday 11-12h UTC, so
+    # off_hours_activity / weekend_activity are constant-0 across the whole real
+    # set — inert). Generating off-hours/weekend rows here would invent a fake
+    # "off-hours -> minority" signal that fails on real test data, so we don't.
+    hour = int(rng.integers(9, 18))     # 09:00-17:59 -> never off-hours
+    dow = int(rng.integers(0, 5))       # Mon-Fri -> never weekend (2023-07-10..14)
+    minute = int(rng.integers(0, 60))
+    event_time = f"2023-07-{10 + dow:02d}T{hour:02d}:{minute:02d}:00Z"
+
+    event = {
+        'eventVersion': '1.08',
+        'eventTime': event_time,
+        'eventName': event_name,
+        'eventSource': event_source,
+        'awsRegion': 'us-east-1',
+        'sourceIPAddress': '203.0.113.%d' % int(rng.integers(1, 254)),
+        'userAgent': 'aws-sdk-go/1.44.0',    # neutral + class-independent
+        'userIdentity': {
+            'type': ui_type,
+            'accountId': '123837392027',
+            'mfaAuthenticated': 'false',
+        },
+        # Real events carry recipientAccountId but no top-level accountId; keep
+        # that shape so cross_account_access matches real (an inert constant).
+        'recipientAccountId': '123837392027',
+        'eventType': 'AwsApiCall',
+        'managementEvent': True,
+    }
+    # Realistic authorization-failure / error rate for the class. (C4's codes
+    # are NOT authz failures, so they correctly leave access_denied_flag at 0.)
+    if spec['denied_codes'] and rng.random() < spec['denied_rate']:
+        event['errorCode'] = spec['denied_codes'][
+            int(rng.integers(0, len(spec['denied_codes'])))]
+    return event

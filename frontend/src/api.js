@@ -41,17 +41,25 @@ api.interceptors.response.use(
 // ---- Detection / dashboard endpoints (require auth) ----
 export const checkHealth = () => api.get('/health')
 export const getMetrics = () => api.get('/metrics')
-// Retrain + hot-swap the model. mode = 'synthetic' | 'real'. For real mode,
-// pass the labeled dataset text (datasetContent) and its filename. Training can
-// take a few seconds, so this call overrides the default axios timeout.
+// Kick off a background retrain + hot-swap. mode = 'synthetic' | 'real'. For
+// real mode, pass the labeled dataset text (datasetContent) and its filename.
+// Returns 202 immediately ({status:'started', ...}); poll getTrainStatus() for
+// live stage + elapsed and the final result. The upload can be a few MB, so a
+// generous timeout covers the POST body itself (not the training, which is async).
 export const reloadTraining = ({ mode = 'synthetic', datasetContent = null, datasetFilename = '', labelKey = null } = {}) =>
   api.post('/train/reload', {
     mode,
     dataset_content: datasetContent,
     dataset_filename: datasetFilename,
     label_key: labelKey,
-  }, { timeout: 120000 })
-export const simulateLog = (threat_class) => api.post('/simulate', { threat_class })
+  }, { timeout: 60000 })
+// Poll the background retrain job: {state:'idle'|'running'|'done'|'error',
+// mode, stage, elapsed_ms, error, result}. result (on 'done') carries the same
+// {status, training, measured} payload the retrain produced.
+export const getTrainStatus = () => api.get('/train/status')
+export const simulateLog = (threat_class, source = 'synthetic') =>
+  api.post('/simulate', { threat_class, source })
+export const getSimAvailability = () => api.get('/simulate/availability')
 export const predict = (audit_log) => api.post('/predict', { audit_log })
 export const explain = (scaled_features, predicted_class) =>
   api.post('/explain', { scaled_features, predicted_class })
@@ -65,7 +73,8 @@ export const getSampleLogs = () => api.get('/analyze/sample')
 
 // ---- Attack Scenario Runner (purple-team loop) ----
 export const getScenarios = () => api.get('/scenarios')
-export const runScenario = (scenario_id) => api.post('/scenario/run', { scenario_id })
+export const runScenario = (scenario_id, source = 'synthetic') =>
+  api.post('/scenario/run', { scenario_id, source })
 
 // ---- Live AWS containment (real sandbox account, human-approved) ----
 export const getLiveStatus = () => api.get('/live/status')

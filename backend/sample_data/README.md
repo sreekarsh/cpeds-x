@@ -27,12 +27,12 @@ the loader tries those automatically, or you can name it explicitly.
 1. **Raw CloudTrail events + a `label`** (what the sample uses, recommended).
    Ordinary CloudTrail-style fields (`eventName`, `userIdentity.arn`,
    `sourceIPAddress`, ...) plus the label. Each event is featurized through the
-   **same** 28-feature pipeline used for live inference, so training and
+   **same** feature pipeline used for live inference, so training and
    detection see data identically. In CSV, use dotted headers like
    `userIdentity.arn` — they are un-flattened into nested objects for you.
 
-2. **Pre-computed 28-feature rows + a `label`.** If a row already contains all
-   28 canonical feature columns (see `ml_engine/preprocessor.py`
+2. **Pre-computed feature rows + a `label`.** If a row already contains all
+   canonical feature columns (see `ml_engine/preprocessor.py`
    `feature_names`), they are used directly with no re-featurization.
 
 ## Formats
@@ -43,7 +43,7 @@ a JSON array, JSON Lines (`.jsonl`), or CSV.
 ## Validation (why a bad file can't break anything)
 
 Before training, the loader checks the file parses, labels are all 0–4, feature
-vectors are length 28, at least two classes are present, there are at least 40
+vectors match the model's expected length, at least two classes are present, there are at least 40
 usable rows, and no class has fewer than 10. If any check fails, an **explicit
 retrain keeps the previous model** and reports why; at server startup it falls
 back to synthetic automatically. Training itself never changes how the model

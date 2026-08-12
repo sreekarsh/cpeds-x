@@ -62,11 +62,11 @@ _load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
 import json
 import random
-import threading
 import time
 
 from ml_engine.model import get_classifier, retrain_classifier, CLASS_LABELS
@@ -74,6 +74,8 @@ from ml_engine.shap_explainer import get_explainer
 from ml_engine.genai_copilot import generate_soc_summary
 from ml_engine.preprocessor import generate_synthetic_audit_log
 from ml_engine.log_ingest import parse_logs, LogParseError
+from ml_engine import dataset_loader
+from train_job import RetrainJob
 from playbooks.mitigation import execute_containment
 import attack_scenarios
 from ml_engine import live_watcher
@@ -115,7 +117,7 @@ class AuditLogRequest(BaseModel):
 
 
 class ExplainRequest(BaseModel):
-    scaled_features: List[float] = Field(..., description="Scaled 28-vector")
+    scaled_features: List[float] = Field(..., description="Scaled feature vector")
     predicted_class: int = Field(..., ge=0, le=4)
 
 
@@ -128,6 +130,9 @@ class MitigateRequest(BaseModel):
 
 class SimulateRequest(BaseModel):
     threat_class: int = Field(0, ge=0, le=4)
+    source: str = Field("synthetic",
+                        description="'synthetic' fabricates an event from a "
+                        "template; 'real' samples a labeled CloudTrail event.")
 
 
 class AnalyzeRequest(BaseModel):
@@ -138,6 +143,9 @@ class AnalyzeRequest(BaseModel):
 
 class ScenarioRunRequest(BaseModel):
     scenario_id: str = Field(..., description="Scenario id from GET /api/v1/scenarios")
+    source: str = Field("synthetic",
+                        description="'synthetic' seeds each step from a template; "
+                        "'real' replays a labeled CloudTrail event of the step's class.")
 
 
 class LivePollRequest(BaseModel):
@@ -177,9 +185,11 @@ MAX_INCIDENTS_PER_UPLOAD = 50
 # Cap uploaded training datasets (raw text) — same 8 MB ceiling as /analyze.
 MAX_DATASET_BYTES = 8 * 1024 * 1024
 
-# Single-flight lock: retraining swaps the shared model singleton, so two
-# concurrent retrains must never overlap. A second one gets HTTP 409.
-_RETRAIN_LOCK = threading.Lock()
+# Background retrain manager. Retraining rebuilds the shared model singleton, so
+# it must be single-flight (never two at once) AND must not block the request —
+# real-mode training + k-fold CV is heavy. RetrainJob runs it on a daemon thread
+# and exposes a pollable status; a second start() while running is refused (409).
+_RETRAIN_JOB = RetrainJob()
 
 
 def _training_status(clf) -> Dict:
@@ -206,6 +216,7 @@ def _training_status(clf) -> Dict:
         "fallback_reason": getattr(clf, "fallback_reason", None),
         "train_rows": info.get("train_rows"),
         "test_rows": info.get("test_rows"),
+        "imbalance_strategy": info.get("imbalance_strategy"),
         "dataset": dataset,
     }
 
@@ -354,17 +365,23 @@ def metrics(current_user: dict = Depends(get_current_user)):
 def train_reload(req: TrainReloadRequest,
                  current_user: dict = Depends(get_current_user)):
     """
-    Retrain the model on a chosen data source and hot-swap it in.
+    Kick off a retrain on a background thread and return immediately.
 
     mode="synthetic" (default) retrains on the built-in synthetic generator —
     always succeeds, and is how you revert. mode="real" trains on an uploaded
     labeled dataset (dataset_content) or the server-configured dataset path; if
-    the dataset is unusable the PREVIOUS model is kept and a 422 explains why.
+    the dataset is unusable the PREVIOUS model is kept and the job ends in an
+    "error" state whose message explains why (poll GET /train/status).
 
-    Guardrails: auth-gated like every detection endpoint; a single-flight lock
-    rejects an overlapping retrain with 409; uploaded content is size-capped.
-    This only rebuilds the in-memory model — it makes no AWS calls and never
-    touches live containment.
+    This is NON-BLOCKING: real-mode training + k-fold CV is heavy enough that
+    running it inside the request made the UI look frozen and, on refresh, wedge
+    on a bare 409. Now the work runs on a daemon thread; the client polls
+    /train/status for stage + elapsed and the final result. Single-flight: a
+    second start while one is running returns 409.
+
+    Guardrails: auth-gated like every detection endpoint; uploaded content is
+    size-capped. This only rebuilds the in-memory model — it makes no AWS calls
+    and never touches live containment.
     """
     mode = (req.mode or "synthetic").lower()
     if mode not in ("synthetic", "real"):
@@ -378,37 +395,91 @@ def train_reload(req: TrainReloadRequest,
                 status_code=413,
                 detail=f"Dataset exceeds the {MAX_DATASET_BYTES // (1024 * 1024)} MB limit.")
 
-    # Non-blocking: a second concurrent retrain is rejected rather than queued.
-    if not _RETRAIN_LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409,
-                            detail="A retrain is already in progress. Try again shortly.")
-    try:
-        label_keys = [req.label_key] if req.label_key else None
+    label_keys = [req.label_key] if req.label_key else None
+    dataset_filename = req.dataset_filename or ""
+
+    def _runner(progress):
+        # Runs on the background thread. retrain_classifier trains strictly in
+        # real mode (DatasetError propagates -> job "error", old model kept) and
+        # atomically hot-swaps the singleton only on success.
         clf = retrain_classifier(
             mode=mode,
             dataset_content=content,
-            dataset_filename=req.dataset_filename or "",
+            dataset_filename=dataset_filename,
             label_keys=label_keys,
+            progress=progress,
         )
-    except ValueError as e:
-        # DatasetError (bad/too-small/unlabeled data) — old model left intact.
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Retrain failed: {e}")
-    finally:
-        _RETRAIN_LOCK.release()
+        return {
+            "status": "retrained",
+            "training": _training_status(clf),
+            "measured": clf.measured_metrics,
+        }
 
-    return {
-        "status": "retrained",
-        "training": _training_status(clf),
-        "measured": clf.measured_metrics,
-    }
+    if not _RETRAIN_JOB.start(mode, _runner):
+        raise HTTPException(
+            status_code=409,
+            detail="A retrain is already in progress. Watch its progress or try again shortly.")
+
+    # 202 Accepted: work has started; poll /train/status for stage + result.
+    return JSONResponse(status_code=202,
+                        content={"status": "started", **_RETRAIN_JOB.status()})
+
+
+@app.get("/api/v1/train/status")
+def train_status(current_user: dict = Depends(get_current_user)):
+    """
+    Live status of the background retrain, for the UI to poll.
+
+    Returns {state: idle|running|done|error, mode, stage, elapsed_ms, error,
+    result}. `result` (present when state=="done") carries the same
+    {status, training, measured} payload the old synchronous call returned, so
+    the frontend can refresh its charts without a second request.
+    """
+    return _RETRAIN_JOB.status()
+
+
+@app.get("/api/v1/simulate/availability")
+def simulate_availability(current_user: dict = Depends(get_current_user)):
+    """Report whether Real mode can be used and how many events exist per class.
+
+    The frontend calls this to enable/disable the Synthetic/Real toggle and to
+    grey out per-class buttons that have no real examples. `available` is False
+    when no labeled dataset is present at all.
+    """
+    avail = dataset_loader.real_event_availability()
+    if avail is None:
+        return {
+            "available": False,
+            "note": ("No labeled dataset found. Set CPEDS_TRAIN_DATASET or add "
+                     "backend/sample_data/stratus_real_labeled.json to enable "
+                     "Real mode."),
+        }
+    return {"available": True, **avail}
 
 
 @app.post("/api/v1/simulate")
 def simulate(req: SimulateRequest, current_user: dict = Depends(get_current_user)):
-    """Generate a synthetic CloudTrail audit log for a given threat class."""
-    return {"audit_log": generate_synthetic_audit_log(req.threat_class)}
+    """Produce a CloudTrail audit log for a given threat class.
+
+    - source="synthetic" (default): fabricate an event from the class template.
+    - source="real": sample a REAL labeled CloudTrail event of that class from
+      the dataset (label stripped) and also return its ground-truth label, so the
+      UI can show truth-vs-prediction (a real hit/miss for the trained model).
+    """
+    source = (req.source or "synthetic").lower()
+    if source == "real":
+        try:
+            event, ground_truth = dataset_loader.sample_real_event(req.threat_class)
+        except dataset_loader.DatasetError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        return {
+            "audit_log": event,
+            "source": "real",
+            "ground_truth_label": ground_truth,
+            "ground_truth_class_label": CLASS_LABELS[ground_truth],
+        }
+    return {"audit_log": generate_synthetic_audit_log(req.threat_class),
+            "source": "synthetic"}
 
 
 def _principal_of(log: dict) -> str:
@@ -629,16 +700,42 @@ def scenario_run(req: ScenarioRunRequest,
     if scenario is None:
         raise HTTPException(status_code=404, detail="Unknown scenario id.")
 
+    source = (req.source or "synthetic").lower()
+    # In real mode, verify a dataset is present up front so we fail cleanly with
+    # a 422 (and the UI keeps its toggle off) rather than erroring mid-campaign.
+    if source == "real" and dataset_loader.real_event_availability() is None:
+        raise HTTPException(
+            status_code=422,
+            detail=("Real mode needs a labeled dataset. Set CPEDS_TRAIN_DATASET "
+                    "or add backend/sample_data/stratus_real_labeled.json."))
+
     clf = get_classifier()
     explainer = get_explainer(clf.lgbm_model, clf.preprocessor.feature_names)
     steps_out: List[Dict] = []
     threats = 0
     contained = 0
+    real_steps = 0
     started = time.perf_counter()
 
     for step in scenario["steps"]:
-        event = attack_scenarios.build_step_event(
-            step, scenario["attacker_principal"], scenario["source_ip"])
+        seeded_class = step.get("threat_class", 0)
+        ground_truth = None
+        step_source = "synthetic"
+        if source == "real":
+            try:
+                event, ground_truth = dataset_loader.sample_real_event(seeded_class)
+                event = attack_scenarios.stamp_identity(
+                    event, scenario["attacker_principal"], scenario["source_ip"])
+                step_source = "real"
+                real_steps += 1
+            except dataset_loader.DatasetError:
+                # This class has no real examples — seed synthetically for this
+                # step so the campaign still plays out end to end.
+                event = attack_scenarios.build_step_event(
+                    step, scenario["attacker_principal"], scenario["source_ip"])
+        else:
+            event = attack_scenarios.build_step_event(
+                step, scenario["attacker_principal"], scenario["source_ip"])
         pred = clf.predict(event)
         pred_class = pred["predicted_class"]
         confidence = pred["confidence"]
@@ -684,6 +781,11 @@ def scenario_run(req: ScenarioRunRequest,
             "xai": shap_result,
             "mitigation": mitigation,
             "localstack": localstack,
+            "step_source": step_source,
+            "ground_truth_label": ground_truth,
+            "ground_truth_class_label": (
+                CLASS_LABELS[ground_truth] if ground_truth is not None else None),
+            "correct": (ground_truth is not None and pred_class == ground_truth),
         })
 
     return {
@@ -698,10 +800,15 @@ def scenario_run(req: ScenarioRunRequest,
         "auto_contained": contained,
         "duration_ms": round((time.perf_counter() - started) * 1000, 1),
         "steps": steps_out,
+        "source": source,
+        "real_steps": real_steps,
         "note": (
             "Verdicts are the model's real predictions. Recon steps are "
             "expected to read benign and escape containment; that honest mix "
             "mirrors a real purple-team engagement."
+            + (" Real mode replays labeled CloudTrail events; steps show the "
+               "model's prediction against the dataset's ground-truth label."
+               if source == "real" else "")
         ),
     }
 

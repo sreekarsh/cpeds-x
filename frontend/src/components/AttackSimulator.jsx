@@ -1,6 +1,7 @@
-import { useState } from 'react'
-import { Zap, ShieldAlert, Database, Play } from 'lucide-react'
-import { simulateLog, predict } from '../api'
+import { useState, useEffect } from 'react'
+import { Zap, ShieldAlert, Database, Play, Check, X } from 'lucide-react'
+import { simulateLog, predict, getSimAvailability } from '../api'
+import SourceToggle from './SourceToggle'
 
 // Threat class -> badge styling
 const CLASS_STYLES = {
@@ -21,25 +22,41 @@ export default function AttackSimulator({ onIncidentSelect }) {
   const [logs, setLogs] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const [source, setSource] = useState('synthetic')
+  const [availability, setAvailability] = useState(null)
+
+  // Discover whether Real mode is possible (and per-class counts) once on mount.
+  useEffect(() => {
+    getSimAvailability()
+      .then((res) => setAvailability(res.data))
+      .catch(() => setAvailability({ available: false, note: 'Could not reach the server.' }))
+  }, [])
+
+  // In real mode, a class with no real examples can't be simulated.
+  const classDisabled = (cls) =>
+    source === 'real' && availability?.available && !(availability.per_class?.[cls] > 0)
 
   const runSimulation = async (threatClass) => {
     setLoading(true)
     setError(null)
     try {
-      // 1. Generate synthetic audit log for the class
-      const simRes = await simulateLog(threatClass)
+      // 1. Get an audit log for the class — synthetic (fabricated) or real
+      //    (a labeled CloudTrail event sampled from the dataset).
+      const simRes = await simulateLog(threatClass, source)
       const auditLog = simRes.data.audit_log
+      const groundTruth = simRes.data.ground_truth_label // present only in real mode
 
       // 2. Run full detection pipeline
       const predRes = await predict(auditLog)
       const data = predRes.data
+      const predictedClass = data.prediction.predicted_class
 
       const incident = {
         id: Date.now(),
         timestamp: new Date().toLocaleTimeString(),
         user: auditLog.userIdentity?.userName || 'unknown',
         principal: auditLog.userIdentity?.arn || 'n/a',
-        predictedClass: data.prediction.predicted_class,
+        predictedClass,
         classLabel: data.prediction.class_label,
         confidence: data.prediction.confidence,
         latency: data.prediction.execution_latency_ms,
@@ -48,15 +65,20 @@ export default function AttackSimulator({ onIncidentSelect }) {
         summary: data.soc_summary,
         mitigation: data.mitigation,
         probabilities: data.prediction.probabilities,
+        source: simRes.data.source || source,
+        groundTruthLabel: groundTruth ?? null,
+        correct: groundTruth != null ? predictedClass === groundTruth : null,
       }
 
       setLogs(prev => [incident, ...prev].slice(0, 20))
     } catch (e) {
-      setError('Backend unreachable. Is FastAPI running on :8000?')
+      setError(e?.response?.data?.detail || 'Backend unreachable. Is FastAPI running on :8000?')
     } finally {
       setLoading(false)
     }
   }
+
+  const realMode = source === 'real'
 
   return (
     <div className="space-y-6">
@@ -66,16 +88,28 @@ export default function AttackSimulator({ onIncidentSelect }) {
           <Zap className="text-cyber-accent" size={20} />
           <h2 className="text-lg font-semibold">Live Telemetry Stream & Attack Simulator</h2>
         </div>
+
+        <div className="mb-4">
+          <SourceToggle
+            source={source}
+            onChange={setSource}
+            availability={availability}
+            disabled={loading}
+          />
+        </div>
+
         <div className="flex flex-wrap gap-3">
           {SIM_BUTTONS.map(btn => {
             const Icon = btn.icon
+            const dis = loading || classDisabled(btn.cls)
             return (
               <button
                 key={btn.cls}
                 onClick={() => runSimulation(btn.cls)}
-                disabled={loading}
+                disabled={dis}
+                title={classDisabled(btn.cls) ? 'No real events of this class in the dataset' : ''}
                 className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-white font-medium
-                            transition-colors disabled:opacity-50 ${btn.color}`}
+                            transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${btn.color}`}
               >
                 <Icon size={16} />
                 {btn.label}
@@ -99,7 +133,9 @@ export default function AttackSimulator({ onIncidentSelect }) {
                 <th className="text-left px-6 py-3">Timestamp</th>
                 <th className="text-left px-6 py-3">User</th>
                 <th className="text-left px-6 py-3">Principal</th>
-                <th className="text-left px-6 py-3">Threat Class</th>
+                {realMode && <th className="text-left px-6 py-3">Ground Truth</th>}
+                <th className="text-left px-6 py-3">Predicted{realMode ? ' (model)' : ''}</th>
+                {realMode && <th className="text-left px-6 py-3">Result</th>}
                 <th className="text-left px-6 py-3">Confidence</th>
                 <th className="text-left px-6 py-3">Action</th>
               </tr>
@@ -107,13 +143,14 @@ export default function AttackSimulator({ onIncidentSelect }) {
             <tbody>
               {logs.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-6 py-10 text-center text-gray-500">
+                  <td colSpan={realMode ? 8 : 6} className="px-6 py-10 text-center text-gray-500">
                     No events yet. Trigger a simulation above.
                   </td>
                 </tr>
               )}
               {logs.map(log => {
                 const style = CLASS_STYLES[log.predictedClass]
+                const truthStyle = log.groundTruthLabel != null ? CLASS_STYLES[log.groundTruthLabel] : null
                 return (
                   <tr
                     key={log.id}
@@ -123,11 +160,37 @@ export default function AttackSimulator({ onIncidentSelect }) {
                     <td className="px-6 py-3 font-mono text-xs text-gray-400">{log.timestamp}</td>
                     <td className="px-6 py-3">{log.user}</td>
                     <td className="px-6 py-3 font-mono text-xs text-gray-400 max-w-[180px] truncate">{log.principal}</td>
+                    {realMode && (
+                      <td className="px-6 py-3">
+                        {truthStyle ? (
+                          <span className={`px-2 py-1 rounded text-xs font-semibold border ${truthStyle.cls}`}>
+                            {truthStyle.label}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-gray-600">—</span>
+                        )}
+                      </td>
+                    )}
                     <td className="px-6 py-3">
                       <span className={`px-2 py-1 rounded text-xs font-semibold border ${style.cls}`}>
                         {style.label}
                       </span>
                     </td>
+                    {realMode && (
+                      <td className="px-6 py-3">
+                        {log.correct == null ? (
+                          <span className="text-xs text-gray-600">—</span>
+                        ) : log.correct ? (
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-green-400">
+                            <Check size={13} /> hit
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-red-400">
+                            <X size={13} /> miss
+                          </span>
+                        )}
+                      </td>
+                    )}
                     <td className="px-6 py-3 font-mono">{(log.confidence * 100).toFixed(1)}%</td>
                     <td className="px-6 py-3">
                       <span className={`text-xs font-semibold ${
@@ -143,7 +206,10 @@ export default function AttackSimulator({ onIncidentSelect }) {
           </table>
         </div>
       </div>
-      <p className="text-xs text-gray-500">Click any row to inspect its XAI breakdown →</p>
+      <p className="text-xs text-gray-500">
+        Click any row to inspect its XAI breakdown →
+        {realMode && ' In Real mode, “Ground Truth” is the dataset label and “Result” shows whether the model matched it.'}
+      </p>
     </div>
   )
 }

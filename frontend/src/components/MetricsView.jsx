@@ -4,7 +4,7 @@ import {
   Target, Award, Activity, Timer, Info, Database, FlaskConical,
   UploadCloud, RefreshCw, Loader2, AlertTriangle, CheckCircle2, X,
 } from 'lucide-react'
-import { getMetrics, reloadTraining, errMessage } from '../api'
+import { getMetrics, reloadTraining, getTrainStatus, errMessage } from '../api'
 
 const CLASS_SHORT = ['C0', 'C1', 'C2', 'C3', 'C4']
 
@@ -29,9 +29,12 @@ export default function MetricsView() {
   const [datasetText, setDatasetText] = useState('')
   const [datasetName, setDatasetName] = useState('')
   const [retraining, setRetraining] = useState(false)
+  const [retrainStage, setRetrainStage] = useState('')      // live progress stage
+  const [retrainElapsed, setRetrainElapsed] = useState(0)   // seconds, from server
   const [retrainError, setRetrainError] = useState('')
   const [retrainOk, setRetrainOk] = useState('')
   const fileInput = useRef(null)
+  const pollTimer = useRef(null)      // setTimeout handle for the status poller
 
   const loadMetrics = useCallback(() => {
     return getMetrics()
@@ -44,7 +47,52 @@ export default function MetricsView() {
       .catch(() => setError('Could not load metrics from backend.'))
   }, [])
 
-  useEffect(() => { loadMetrics() }, [loadMetrics])
+  // Poll the background retrain job until it leaves the "running" state. Called
+  // both right after kicking a retrain off AND on mount (so a job already in
+  // flight — e.g. after a page refresh — resumes its progress display and keeps
+  // the button correctly disabled instead of looking stuck or throwing a 409).
+  const pollTrainStatus = useCallback(() => {
+    getTrainStatus()
+      .then(r => {
+        const s = r.data || {}
+        setRetrainElapsed(Math.round((s.elapsed_ms || 0) / 1000))
+        if (s.state === 'running') {
+          setRetraining(true)
+          setRetrainStage(s.stage || 'Working…')
+          pollTimer.current = setTimeout(pollTrainStatus, 1500)
+          return
+        }
+        // Terminal states: stop polling and settle the UI.
+        setRetraining(false)
+        setRetrainStage('')
+        if (s.state === 'done') {
+          const acc = s.result?.measured?.lightgbm_accuracy
+          const eff = s.result?.training?.effective_mode
+          setRetrainError('')
+          setRetrainOk(
+            `Retrained on ${eff === 'real' ? 'your real dataset' : 'synthetic data'}` +
+            (acc != null ? ` — LightGBM accuracy ${(acc * 100).toFixed(1)}%.` : '.')
+          )
+          loadMetrics()   // refresh charts (CV macro-F1 strip appears when present)
+        } else if (s.state === 'error') {
+          setRetrainOk('')
+          setRetrainError(s.error || 'Retrain failed.')
+          loadMetrics()   // model was left intact; re-sync the active-mode badge
+        }
+      })
+      .catch(() => {
+        // A transient status-poll failure shouldn't wedge the button; stop and
+        // let the user retry. (A real in-flight job will still finish server-side.)
+        setRetraining(false)
+        setRetrainStage('')
+      })
+  }, [loadMetrics])
+
+  useEffect(() => {
+    loadMetrics()
+    pollTrainStatus()  // resume any retrain already running (survives refresh)
+    return () => { if (pollTimer.current) clearTimeout(pollTimer.current) }
+  }, [loadMetrics, pollTrainStatus])
 
   const readDataset = (file) => {
     setRetrainError(''); setRetrainOk('')
@@ -70,24 +118,28 @@ export default function MetricsView() {
       setRetrainError('Choose a labeled dataset file first, or switch to Synthetic.')
       return
     }
+    // Optimistically show progress; the poller takes over once the job is live.
     setRetraining(true)
+    setRetrainStage('Starting…')
+    setRetrainElapsed(0)
     try {
-      const res = await reloadTraining({
+      // Returns 202 as soon as the background job starts — does NOT wait for
+      // training to finish. Progress + the final result come from pollTrainStatus.
+      await reloadTraining({
         mode,
         datasetContent: mode === 'real' ? datasetText : null,
         datasetFilename: mode === 'real' ? datasetName : '',
       })
-      const t = res.data?.training
-      const acc = res.data?.measured?.lightgbm_accuracy
-      setRetrainOk(
-        `Retrained on ${t?.effective_mode === 'real' ? 'your real dataset' : 'synthetic data'}` +
-        (acc != null ? ` — LightGBM accuracy ${(acc * 100).toFixed(1)}%.` : '.')
-      )
-      await loadMetrics() // refresh charts with the new model's numbers
+      pollTrainStatus()
     } catch (e) {
-      setRetrainError(errMessage(e))
-    } finally {
+      // 409 => a job is already running: just attach to it instead of erroring.
+      if (e?.response?.status === 409) {
+        pollTrainStatus()
+        return
+      }
       setRetraining(false)
+      setRetrainStage('')
+      setRetrainError(errMessage(e))
     }
   }
 
@@ -185,7 +237,8 @@ export default function MetricsView() {
         <div className="mb-4 inline-flex rounded-lg border border-cyber-border bg-cyber-bg p-1">
           <button
             onClick={() => { setMode('synthetic'); setRetrainError(''); setRetrainOk('') }}
-            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+            disabled={retraining}
+            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
               mode === 'synthetic' ? 'bg-cyber-accent text-cyber-bg' : 'text-gray-400 hover:text-gray-200'
             }`}
           >
@@ -193,7 +246,8 @@ export default function MetricsView() {
           </button>
           <button
             onClick={() => { setMode('real'); setRetrainError(''); setRetrainOk('') }}
-            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+            disabled={retraining}
+            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
               mode === 'real' ? 'bg-cyber-accent text-cyber-bg' : 'text-gray-400 hover:text-gray-200'
             }`}
           >
@@ -244,7 +298,9 @@ export default function MetricsView() {
             className="flex items-center gap-2 rounded-lg bg-cyber-accent px-4 py-2.5 text-sm font-semibold text-cyber-bg transition-colors hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {retraining ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
-            {retraining ? 'Retraining…' : `Retrain (${mode})`}
+            {retraining
+              ? `${retrainStage || 'Retraining'}… (${retrainElapsed}s)`
+              : `Retrain (${mode})`}
           </button>
           {training?.dataset && training.effective_mode === 'real' && (
             <span className="text-xs text-gray-500">
@@ -254,6 +310,17 @@ export default function MetricsView() {
             </span>
           )}
         </div>
+
+        {/* How class imbalance was handled for this model */}
+        {training?.imbalance_strategy && (
+          <p className="mt-3 text-xs text-gray-500">
+            Imbalance handling:{' '}
+            <span className="font-mono text-gray-300">{training.imbalance_strategy}</span>
+            {training.effective_mode === 'real'
+              ? ' — real data uses cost-sensitive class weights (not SMOTE), which lifts minority-class recall without fabricating rows.'
+              : ' — synthetic classes are evenly sized, so SMOTE balances the train fold.'}
+          </p>
+        )}
 
         {/* real-mode fell back to synthetic (startup only) */}
         {training?.fallback_reason && (
@@ -289,6 +356,30 @@ export default function MetricsView() {
           )
         })}
       </div>
+
+      {/* Cross-validated macro-F1 — the trustworthy headline for imbalanced real data */}
+      {measured.cv_macro_f1_mean != null && (
+        <div className="rounded-xl border border-cyber-accent/30 bg-cyber-accent/5 p-5">
+          <div className="flex flex-wrap items-center gap-3">
+            <Award size={18} className="text-cyber-accent" />
+            <h3 className="font-semibold">Cross-Validated Macro-F1 — the honest headline</h3>
+            <span className="ml-auto font-mono text-2xl font-bold text-cyber-accent">
+              {(measured.cv_macro_f1_mean * 100).toFixed(1)}%
+              <span className="ml-1 text-sm font-normal text-gray-400">
+                ± {(measured.cv_macro_f1_std * 100).toFixed(1)}%
+              </span>
+            </span>
+          </div>
+          <p className="mt-2 text-xs text-gray-400">
+            Averaged over {measured.cv_folds}-fold stratified cross-validation across the whole
+            dataset. On an imbalanced dataset, <span className="text-gray-200">accuracy is
+            misleading</span> — a model that always predicts “benign” can score high while
+            catching zero attacks. Macro-F1 weights every class equally, and cross-validating it
+            removes the luck of a single tiny test split. <span className="text-gray-200">This is
+            the number to cite</span>, not the single-split accuracy above.
+          </p>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Accuracy comparison bar chart */}
@@ -361,6 +452,9 @@ export default function MetricsView() {
             <h3 className="font-semibold">Per-Class Performance (LightGBM, measured)</h3>
             <p className="mt-0.5 text-xs text-gray-500">
               Precision, recall and F1 per threat class on the held-out test set.
+              <span className="text-gray-400"> Test n</span> is how many real test
+              rows that class had — rows with a small n (highlighted) are
+              high-variance, so read their scores as rough, not exact.
             </p>
           </div>
           <table className="w-full text-sm">
@@ -370,19 +464,35 @@ export default function MetricsView() {
                 <th className="px-6 py-3 text-left">Precision</th>
                 <th className="px-6 py-3 text-left">Recall</th>
                 <th className="px-6 py-3 text-left">F1</th>
+                <th className="px-6 py-3 text-left">Test n</th>
               </tr>
             </thead>
             <tbody>
-              {perClass.map((r) => (
-                <tr key={r.class} className="border-t border-cyber-border">
-                  <td className="px-6 py-3 font-medium text-gray-200">{r.label}</td>
-                  <td className="px-6 py-3 font-mono">{(r.precision * 100).toFixed(1)}%</td>
-                  <td className="px-6 py-3 font-mono">{(r.recall * 100).toFixed(1)}%</td>
-                  <td className="px-6 py-3 font-mono text-cyber-accent">{(r.f1 * 100).toFixed(1)}%</td>
-                </tr>
-              ))}
+              {perClass.map((r) => {
+                const n = r.support
+                const lowN = typeof n === 'number' && n < 20
+                return (
+                  <tr key={r.class}
+                      className={`border-t border-cyber-border${lowN ? ' bg-amber-500/5' : ''}`}>
+                    <td className="px-6 py-3 font-medium text-gray-200">{r.label}</td>
+                    <td className="px-6 py-3 font-mono">{(r.precision * 100).toFixed(1)}%</td>
+                    <td className="px-6 py-3 font-mono">{(r.recall * 100).toFixed(1)}%</td>
+                    <td className="px-6 py-3 font-mono text-cyber-accent">{(r.f1 * 100).toFixed(1)}%</td>
+                    <td className={`px-6 py-3 font-mono ${lowN ? 'text-amber-400' : 'text-gray-400'}`}>
+                      {n == null ? '—' : n}
+                      {lowN && <span className="ml-1 text-[10px] uppercase tracking-wide">low</span>}
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
+          <div className="px-6 py-3 border-t border-cyber-border text-xs text-gray-500">
+            A class with only a few test rows (e.g. n=5) can show an extreme
+            precision or recall from a single misclassification. The
+            cross-validated macro-F1 above averages over folds and is the honest
+            headline for this imbalanced dataset.
+          </div>
         </div>
       )}
     </div>

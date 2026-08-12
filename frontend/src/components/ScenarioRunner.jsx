@@ -2,8 +2,10 @@ import { useState, useEffect, useRef } from 'react'
 import {
   Swords, Play, Loader2, ShieldCheck, ShieldAlert, Crosshair,
   ChevronRight, Target, Clock, Radar, AlertTriangle, CheckCircle2,
+  Check, X,
 } from 'lucide-react'
-import { getScenarios, runScenario, errMessage } from '../api'
+import { getScenarios, runScenario, getSimAvailability, errMessage } from '../api'
+import SourceToggle from './SourceToggle'
 
 // Threat class -> badge styling (shared palette with the other tabs).
 const CLASS_STYLES = {
@@ -30,6 +32,8 @@ function stepToIncident(step, run) {
     summary: step.soc_summary,
     mitigation: step.mitigation,
     probabilities: step.probabilities,
+    groundTruthLabel: step.ground_truth_label ?? null,
+    correct: step.ground_truth_label != null ? step.correct : null,
   }
 }
 
@@ -53,6 +57,8 @@ export default function ScenarioRunner({ onIncidentSelect }) {
   const [error, setError] = useState('')
   const [run, setRun] = useState(null)
   const [revealed, setRevealed] = useState(0) // steps shown so far (live feel)
+  const [source, setSource] = useState('synthetic')
+  const [availability, setAvailability] = useState(null)
   const timers = useRef([])
 
   useEffect(() => {
@@ -63,6 +69,10 @@ export default function ScenarioRunner({ onIncidentSelect }) {
       })
       .catch((e) => setError(errMessage(e)))
       .finally(() => setLoadingList(false))
+    // Whether Real mode can replay labeled events (and per-class counts).
+    getSimAvailability()
+      .then((res) => setAvailability(res.data))
+      .catch(() => setAvailability({ available: false, note: 'Could not reach the server.' }))
     // Clear any pending reveal timers on unmount.
     return () => timers.current.forEach(clearTimeout)
   }, [])
@@ -76,7 +86,7 @@ export default function ScenarioRunner({ onIncidentSelect }) {
     timers.current.forEach(clearTimeout)
     timers.current = []
     try {
-      const res = await runScenario(selectedId)
+      const res = await runScenario(selectedId, source)
       setRun(res.data)
       // Stagger the reveal so the timeline plays out like a live engagement.
       const total = res.data.steps.length
@@ -144,7 +154,16 @@ export default function ScenarioRunner({ onIncidentSelect }) {
           </div>
         )}
 
-        <div className="mt-5 flex flex-wrap items-center gap-3">
+        <div className="mt-5">
+          <SourceToggle
+            source={source}
+            onChange={setSource}
+            availability={availability}
+            disabled={running}
+          />
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center gap-3">
           <button
             onClick={launch}
             disabled={running || !selectedId}
@@ -187,7 +206,18 @@ export default function ScenarioRunner({ onIncidentSelect }) {
 
           <div className="rounded-xl border border-cyber-border bg-cyber-panel">
             <div className="border-b border-cyber-border px-6 py-4">
-              <h3 className="font-semibold">Attack Timeline — {run.scenario_name}</h3>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="font-semibold">Attack Timeline — {run.scenario_name}</h3>
+                {run.source === 'real' && (() => {
+                  const scored = run.steps.filter((s) => s.ground_truth_label != null)
+                  const hits = scored.filter((s) => s.correct).length
+                  return scored.length ? (
+                    <span className="rounded border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1 font-mono text-xs text-cyan-300">
+                      real replay · model {hits}/{scored.length} correct
+                    </span>
+                  ) : null
+                })()}
+              </div>
               <p className="mt-0.5 font-mono text-xs text-gray-500">
                 attacker: {run.attacker_principal} · origin: {run.source_ip}
               </p>
@@ -218,6 +248,8 @@ function TimelineStep({ step, isLast, onInspect }) {
   const contained = step.action_status === 'CONTAINED'
   const style = CLASS_STYLES[step.predicted_class] || CLASS_STYLES[0]
   const ls = step.localstack
+  const hasTruth = step.ground_truth_label != null
+  const truthStyle = hasTruth ? (CLASS_STYLES[step.ground_truth_label] || CLASS_STYLES[0]) : null
 
   return (
     <li className="relative flex gap-4 pb-6 last:pb-0">
@@ -236,10 +268,24 @@ function TimelineStep({ step, isLast, onInspect }) {
               <span className="rounded bg-cyber-panel px-1.5 py-0.5 font-mono text-[10px] text-gray-500">
                 {step.event_name}
               </span>
+              {step.step_source === 'real' && (
+                <span className="rounded bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[10px] text-cyan-400">
+                  real event
+                </span>
+              )}
             </div>
             <p className="mt-1 text-xs text-gray-500">{step.description}</p>
           </div>
-          <span className={`rounded border px-2 py-1 text-xs font-semibold ${style.cls}`}>{style.label}</span>
+          <div className="flex flex-col items-end gap-1">
+            {hasTruth && (
+              <span className={`rounded border px-2 py-0.5 text-[10px] font-semibold ${truthStyle.cls}`}>
+                truth: {truthStyle.label}
+              </span>
+            )}
+            <span className={`rounded border px-2 py-1 text-xs font-semibold ${style.cls}`}>
+              {hasTruth ? 'pred: ' : ''}{style.label}
+            </span>
+          </div>
         </div>
 
         {/* MITRE ATT&CK tag + verdict line */}
@@ -257,6 +303,17 @@ function TimelineStep({ step, isLast, onInspect }) {
             {(step.confidence * 100).toFixed(1)}% conf
           </span>
           <span className="font-mono text-xs text-gray-500">{step.execution_latency_ms} ms</span>
+          {hasTruth && (
+            step.correct ? (
+              <span className="inline-flex items-center gap-1 text-xs font-semibold text-green-400">
+                <Check size={13} /> model hit
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 text-xs font-semibold text-red-400">
+                <X size={13} /> model miss
+              </span>
+            )
+          )}
           <span className={contained ? 'font-semibold text-red-400' : 'font-medium text-gray-500'}>
             {contained ? '⚑ AUTO-CONTAINED' : 'MONITORED'}
           </span>
